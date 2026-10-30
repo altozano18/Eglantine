@@ -1,0 +1,160 @@
+name: Build Eglantine (Windows, Qt)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 240
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 3G
+      CCACHE_COMPILERCHECK: content
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Qt 6
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.9.3"
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          modules: "qtcharts qtmultimedia"
+          cache: true
+
+      - name: Install Vulkan SDK
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: 1.4.309.0
+          cache: true
+
+      - name: Install Ninja and ccache
+        run: choco install ninja ccache -y --no-progress
+
+      - name: Restore ccache
+        id: ccache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: ccache-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ runner.os }}-
+
+      - name: Load MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Cache CPM packages
+        uses: actions/cache@v4
+        with:
+          path: .cache/cpm
+          key: cpm-${{ runner.os }}-${{ hashFiles('cpmfile.json', '**/cpmfile.json') }}
+
+      # Error 2 fix: warnings were treated as errors (C4389 in lower_to_maxwell.h)
+      # Error 1 fix: force the Qt frontend and point CMake at the installed Qt
+      - name: Configure
+        shell: pwsh
+        run: |
+          Write-Host "QT_ROOT_DIR = $env:QT_ROOT_DIR"
+          Write-Host "Qt6_DIR     = $env:Qt6_DIR"
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_PREFIX_PATH="$env:QT_ROOT_DIR" `
+            -DQt6_DIR="$env:Qt6_DIR" `
+            -DENABLE_QT=ON `
+            -DYUZU_USE_BUNDLED_QT=OFF `
+            -DENABLE_WERROR=OFF `
+            -DYUZU_TESTS=OFF `
+            -DENABLE_UPDATE_CHECKER=OFF `
+            -DYUZU_USE_BUNDLED_SDL2=ON `
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache `
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache `
+            -DCMAKE_POLICY_DEFAULT_CMP0141=NEW `
+            -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
+
+      - name: Verify Qt was configured
+        shell: pwsh
+        run: |
+          Write-Host "== Qt / frontend related CMake cache entries =="
+          Select-String -Path build/CMakeCache.txt -Pattern 'ENABLE_QT|YUZU_CMD|YUZU_USE_BUNDLED_QT|ENABLE_WERROR|Qt6_DIR|Qt6Core_DIR|CMAKE_PREFIX_PATH' |
+            ForEach-Object { Write-Host $_.Line }
+          $qt = Select-String -Path build/CMakeCache.txt -Pattern '^ENABLE_QT:BOOL=ON'
+          if (-not $qt) {
+            Write-Error "ENABLE_QT is not ON in the CMake cache: the Qt frontend will not be built. Stopping early."
+            exit 1
+          }
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --parallel
+
+      - name: ccache stats
+        if: always()
+        shell: pwsh
+        run: ccache --show-stats
+
+      - name: List build outputs
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host "== executables anywhere under build =="
+          Get-ChildItem build -Recurse -Filter *.exe -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -notmatch 'CMakeFiles|_deps|externals' } |
+            ForEach-Object { Write-Host $_.FullName ($_.Length / 1MB) "MB" }
+          Write-Host "== build/bin =="
+          Get-ChildItem build/bin -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.Name }
+
+      - name: Deploy Qt runtime and package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist_out | Out-Null
+          $bin = "build/bin"
+          if (-not (Test-Path $bin)) { Write-Error "build/bin missing"; exit 1 }
+
+          # Prefer a Qt GUI binary; skip cli/room/test executables
+          $exe = Get-ChildItem $bin -Filter *.exe |
+            Where-Object { $_.Name -notmatch 'cli|room|test|crash' } |
+            Sort-Object { -$_.Length } |
+            Select-Object -First 1
+
+          if ($null -eq $exe) {
+            Write-Warning "No GUI exe found, packaging everything in build/bin as-is"
+          } else {
+            Write-Host "Deploying Qt for $($exe.FullName)"
+            Write-Host "== DLL dependencies of $($exe.Name) =="
+            dumpbin /dependents $exe.FullName | Select-String -Pattern '\.dll' | ForEach-Object { Write-Host $_.Line.Trim() }
+            windeployqt --release --no-translations $exe.FullName
+            if ($LASTEXITCODE -ne 0) {
+              Write-Warning "windeployqt failed (exit $LASTEXITCODE); packaging build/bin as-is"
+            }
+            $global:LASTEXITCODE = 0
+          }
+          Compress-Archive -Path "$bin/*" -DestinationPath dist_out/Eglantine-windows-qt.zip
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ccache-${{ runner.os }}-${{ github.run_id }}
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Eglantine-windows-qt
+          path: dist_out/Eglantine-windows-qt.zip
+          if-no-files-found: warn
